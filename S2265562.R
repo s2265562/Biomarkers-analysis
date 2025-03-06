@@ -127,6 +127,12 @@ required_packages <- c("readxl", "tidyverse", "janitor", "ggpubr", "moments", "n
 new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
 if(length(new_packages)) install.packages(new_packages)
 
+# Install and load required packages
+required_packages <- c("readxl", "tidyverse", "janitor", "ggpubr", "moments", "nortest", 
+                       "caret", "broom", "performance", "car", "randomForest", "GGally", "ggcorrplot")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
 # Load libraries
 library(readxl)
 library(tidyverse)
@@ -138,93 +144,115 @@ library(caret)
 library(broom)
 library(performance)
 library(car)
-library(GGally)
 library(randomForest)
-library(knitr)
-library(kableExtra)
+library(GGally)
+library(ggcorrplot)
 
-# Set working directory
+# Set working directory (update if necessary)
 setwd("/Users/colm.mulcahy/Documents/R_projects/UOE_Probability and Statistics_Final Assignment")
 
 # Read and clean datasets
 covariates <- read_excel("covariates.xlsx") %>% clean_names()
 biomarkers <- read_excel("biomarkers.xlsx") %>% clean_names()
 
-# Merge datasets
+# Merge datasets and clean
 merged_data <- biomarkers %>%
   separate(biomarker, into = c("patient_id", "time_point"), sep = "-") %>%
   mutate(patient_id = as.numeric(patient_id)) %>%
-  left_join(covariates, by = "patient_id")
+  left_join(covariates, by = "patient_id") %>%
+  drop_na()
 
-# Create VAS grouping
-table(merged_data$vas_at_inclusion)
+# Create binary pain group variable (High VAS ≥5, Low VAS <5)
 merged_data <- merged_data %>%
   mutate(vas_group = ifelse(vas_at_inclusion >= 5, "High_VAS", "Low_VAS"))
 
-# Select relevant variables for regression
+# Select relevant variables for regression analysis
 regression_data <- merged_data %>%
   select(vas_12months, il_8, vegf_a, opg, tgf_beta_1, il_6, cxcl9, cxcl1, il_18, csf_1, age, sex_1_male_2_female, smoker_1_yes_2_no) %>%
   drop_na()
 
-# Check structure
-str(regression_data)
-summary(regression_data)
+# Step 1: Exploratory Data Analysis (EDA)
+## Check normality of biomarkers
+normality_results <- sapply(regression_data %>% select(-vas_12months), function(x) shapiro.test(x)$p.value)
+print("Shapiro-Wilk Normality Test (p-values):")
+print(round(normality_results, 3))
 
-# Split data into training (80%) and test (20%)
+## Correlation matrix
+cor_matrix <- cor(regression_data %>% select(-vas_12months))
+ggcorrplot(cor_matrix, method = "circle", title = "Correlation Matrix of Predictors")
+
+## Variance Inflation Factor (VIF) for collinearity check
+initial_model <- lm(vas_12months ~ ., data = regression_data)
+vif_values <- car::vif(initial_model)
+print("Variance Inflation Factor (VIF) Scores:")
+print(vif_values)
+
+# Step 2: Model Training & Performance Evaluation
+## Split Data: 80% Training, 20% Testing
 set.seed(42)
 train_indices <- createDataPartition(regression_data$vas_12months, p = 0.8, list = FALSE)
 train_data <- regression_data[train_indices, ]
 test_data  <- regression_data[-train_indices, ]
 
-# Fit Linear Regression Model
-final_model <- lm(vas_12months ~ ., data = train_data)
-summary(final_model)
+# Fit Linear Regression Model (for comparison)
+lm_model <- lm(vas_12months ~ ., data = train_data)
+summary(lm_model)
 
-# Compute Variance Inflation Factor (VIF)
-vif_values <- car::vif(final_model)
-print(vif_values)
-
-# Make predictions on test data
-test_data$predicted_vas <- predict(final_model, newdata = test_data)
-
-# Compute model performance metrics
-model_performance <- data.frame(
-  RMSE = sqrt(mean((test_data$predicted_vas - test_data$vas_12months)^2)),
-  MAE = mean(abs(test_data$predicted_vas - test_data$vas_12months)),
-  R2 = cor(test_data$predicted_vas, test_data$vas_12months)^2
+# Compute Model Performance for Linear Regression
+test_data$lm_pred <- predict(lm_model, newdata = test_data)
+lm_performance <- data.frame(
+  RMSE = sqrt(mean((test_data$lm_pred - test_data$vas_12months)^2)),
+  MAE = mean(abs(test_data$lm_pred - test_data$vas_12months)),
+  R2 = cor(test_data$lm_pred, test_data$vas_12months)^2
 )
-print(model_performance)
+print("Linear Regression Performance:")
+print(lm_performance)
 
 # Fit Random Forest Model
 set.seed(42)
 rf_model <- randomForest(vas_12months ~ ., data = train_data, ntree = 500, importance = TRUE)
 print(rf_model)
 
-# Make predictions
+# Make predictions on test data
 test_data$rf_pred <- predict(rf_model, newdata = test_data)
 
-# Compute performance metrics for Random Forest
+# Compute Model Performance for Random Forest
 rf_performance <- data.frame(
   RMSE = sqrt(mean((test_data$rf_pred - test_data$vas_12months)^2)),
   MAE = mean(abs(test_data$rf_pred - test_data$vas_12months)),
   R2 = cor(test_data$rf_pred, test_data$vas_12months)^2
 )
+print("Random Forest Performance:")
 print(rf_performance)
 
-# Visualization: Regression Coefficients
-tidy_results <- tidy(final_model)
+# Step 3: Feature Importance Analysis
+importance_scores <- importance(rf_model)
+importance_df <- data.frame(
+  Biomarker = rownames(importance_scores),
+  Importance = importance_scores[, 1]
+) %>%
+  arrange(desc(Importance))
 
-ggplot(tidy_results, aes(x = reorder(term, estimate), y = estimate, fill = p.value < 0.05)) +
+# Print Feature Importance
+print("Feature Importance (Mean Decrease in Accuracy):")
+print(importance_df)
+
+# Step 4: Visualization
+## Regression Coefficients (for Linear Model)
+lm_results <- tidy(lm_model) %>%
+  mutate(across(c(estimate, std.error, statistic, p.value), round, 3))
+
+ggplot(lm_results, aes(x = reorder(term, estimate), y = estimate, fill = p.value < 0.05)) +
   geom_bar(stat = "identity", color = "black") +
   coord_flip() +
   theme_minimal() +
   scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "grey")) +
-  ggtitle("Regression Coefficients for 12-Month VAS Prediction") +
+  ggtitle("Linear Regression Coefficients for 12-Month VAS Prediction") +
   xlab("Predictor Variables") +
   ylab("Estimated Effect on 12-Month VAS") +
   theme(legend.position = "none")
 
-# Visualization: Random Forest Model Predictions
+## Predicted vs. Actual (Random Forest)
 ggplot(test_data, aes(x = vas_12months, y = rf_pred)) +
   geom_point(color = "blue") +
   geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
@@ -233,13 +261,18 @@ ggplot(test_data, aes(x = vas_12months, y = rf_pred)) +
   ylab("Predicted VAS Score") +
   theme_minimal()
 
-# Export regression table
-linear_results <- tidy(final_model) %>%
-  mutate(across(c(estimate, std.error, statistic, p.value), round, 3))
+## Feature Importance Plot
+ggplot(importance_df, aes(x = reorder(Biomarker, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "black") +
+  coord_flip() +
+  ggtitle("Feature Importance: Random Forest Model") +
+  xlab("Biomarkers & Covariates") +
+  ylab("Mean Decrease in Accuracy") +
+  theme_minimal()
 
-print(linear_results)
-
-linear_results %>%
-  select(term, estimate, std.error, statistic, p.value) %>%
-  kable("latex", booktabs = TRUE, caption = "Regression Coefficients for 12-Month VAS Prediction") %>%
-  kable_styling(latex_options = c("striped", "hold_position"))
+# Final Output
+list(
+  "Linear Regression Performance" = lm_performance,
+  "Random Forest Performance" = rf_performance,
+  "Feature Importance" = importance_df
+)
